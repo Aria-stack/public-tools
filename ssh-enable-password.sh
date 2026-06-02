@@ -67,9 +67,12 @@ DROPIN_DIR="/etc/ssh/sshd_config.d"
 # 注意：用纯 shell 拼时间戳，避免依赖外部命令；目录名带 PID 保证唯一
 TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo backup)"
 BAK_DIR="/root/sshd-config-backup-${TS}-$$"
-mkdir -p "$BAK_DIR"
-cp -a "$MAIN_CFG" "$BAK_DIR/" 2>/dev/null || true
-[ -d "$DROPIN_DIR" ] && cp -a "$DROPIN_DIR" "$BAK_DIR/sshd_config.d" 2>/dev/null || true
+mkdir -p "$BAK_DIR" || die "无法创建备份目录 $BAK_DIR"
+# 备份是「不锁死」的安全前提，失败必须中止——不能 `|| true` 静默吞掉
+cp -a "$MAIN_CFG" "$BAK_DIR/sshd_config" || die "备份 $MAIN_CFG 失败，已中止（未做任何改动）"
+if [ -d "$DROPIN_DIR" ]; then
+  cp -a "$DROPIN_DIR" "$BAK_DIR/sshd_config.d" || die "备份 $DROPIN_DIR 失败，已中止"
+fi
 ok "已备份当前 SSH 配置到 $BAK_DIR"
 
 # ---------- 中和冲突的 drop-in ----------
@@ -82,6 +85,12 @@ neutralize_dropins() {
   for f in "$DROPIN_DIR"/*.conf; do
     [ -e "$f" ] || continue
     [ "$(basename "$f")" = "99-enable-password.conf" ] && continue
+    # 含 Match 块的文件不动：块内指令是按用户/来源限定的策略，无脑注释会改变语义。
+    # 由结尾的 `sshd -T` 自检兜底，用户能看到实际生效值。
+    if grep -Eiq '^\s*Match\b' "$f"; then
+      warn "跳过含 Match 块的 drop-in（避免误改限定策略）: $f"
+      continue
+    fi
     changed=0
     if grep -Eiq '^\s*(PasswordAuthentication|PermitRootLogin|KbdInteractiveAuthentication)\b' "$f"; then
       # 把这些指令行整体注释掉
@@ -129,9 +138,11 @@ apply_config
 # ---------- 校验，失败回滚 ----------
 if ! "$SSHD_BIN" -t 2>/tmp/sshd-test.$$; then
   warn "sshd 配置校验失败，正在回滚……"
-  cp -a "$BAK_DIR/$(basename "$MAIN_CFG")" "$MAIN_CFG" 2>/dev/null || cp -a "$BAK_DIR/sshd_config" "$MAIN_CFG"
+  cp -a "$BAK_DIR/sshd_config" "$MAIN_CFG" || warn "主配置回滚失败！请手动从 $BAK_DIR 恢复"
   if [ -d "$BAK_DIR/sshd_config.d" ]; then
-    rm -rf "$DROPIN_DIR"; cp -a "$BAK_DIR/sshd_config.d" "$DROPIN_DIR"
+    if ! { rm -rf "$DROPIN_DIR" && cp -a "$BAK_DIR/sshd_config.d" "$DROPIN_DIR"; }; then
+      warn "drop-in 回滚失败！请手动从 $BAK_DIR 恢复"
+    fi
   fi
   cat /tmp/sshd-test.$$ >&2; rm -f /tmp/sshd-test.$$
   die "已回滚到改动前的配置，未重启服务。" 2
@@ -142,8 +153,12 @@ ok "sshd 配置语法校验通过"
 # ---------- 设置 root 密码 ----------
 if [ "$DO_PASSWORD" = 1 ]; then
   if [ "$GEN_RANDOM" = 1 ] && [ -z "$ROOT_PASS" ]; then
-    # 生成 20 位强随机密码（无歧义字符）
-    GENERATED_PASS="$(LC_ALL=C tr -dc 'A-Za-z0-9@#%+=' </dev/urandom | head -c 20)"
+    # 生成 20 位强随机密码（无歧义字符）。
+    # 注意：不要写成 `tr ... </dev/urandom | head -c 20`——head 读够就关管道，
+    # tr 收到 SIGPIPE 退出码 141，在 set -o pipefail 下会直接中断整个脚本。
+    # 改为先取有限字节再过滤再截断，全程无 SIGPIPE。
+    GENERATED_PASS="$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9@#%+=' | cut -c1-20)"
+    [ "${#GENERATED_PASS}" -ge 16 ] || die "随机密码生成异常（长度不足）"
     ROOT_PASS="$GENERATED_PASS"
   fi
   if [ -z "$ROOT_PASS" ]; then
